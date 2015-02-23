@@ -5,6 +5,7 @@
 package JMeter.plugins.functional.samplers.websocket;
 
 import java.io.IOException;
+
 import org.apache.commons.lang3.StringUtils;
 import org.apache.jmeter.config.Argument;
 import org.apache.jmeter.config.Arguments;
@@ -20,15 +21,18 @@ import org.apache.jorphan.logging.LoggingManager;
 import org.apache.jorphan.util.JOrphanUtils;
 import org.apache.log.Logger;
 
-
 import java.io.UnsupportedEncodingException;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+
 import org.apache.jmeter.testelement.TestStateListener;
 import org.eclipse.jetty.util.ssl.SslContextFactory;
+import org.eclipse.jetty.websocket.api.StatusCode;
 import org.eclipse.jetty.websocket.client.ClientUpgradeRequest;
 import org.eclipse.jetty.websocket.client.WebSocketClient;
 
@@ -50,58 +54,16 @@ public class WebSocketSampler extends AbstractSampler implements TestStateListen
     private static final String DEFAULT_PROTOCOL = "ws";
     
     private static Map<String, ServiceSocket> connectionList;
+    private static ExecutorService executor = Executors.newCachedThreadPool();
 
     public WebSocketSampler() {
         super();
         setName("WebSocket sampler");
     }
 
-    private ServiceSocket getConnectionSocket() throws URISyntaxException, Exception {
-        URI uri = getUri();
-
-        String connectionId = getThreadName() + getConnectionId();
-        ServiceSocket socket;
-
-        //Create WebSocket client
-        SslContextFactory sslContexFactory = new SslContextFactory();
-        sslContexFactory.setTrustAll(isIgnoreSslErrors());
-        WebSocketClient webSocketClient = new WebSocketClient(sslContexFactory);        
-        
-        if (isStreamingConnection()) {
-             if (connectionList.containsKey(connectionId)) {
-                 socket = connectionList.get(connectionId);
-                 socket.initialize();
-                 return socket;
-             } else {
-                socket = new ServiceSocket(this, webSocketClient);
-                connectionList.put(connectionId, socket);
-             }
-        } else {
-            socket = new ServiceSocket(this, webSocketClient);
-        }
-
-        //Start WebSocket client thread and upgrage HTTP connection
-        webSocketClient.start();
-        ClientUpgradeRequest request = new ClientUpgradeRequest();
-        webSocketClient.connect(socket, uri, request);
-        
-        //Get connection timeout or use the default value
-        int connectionTimeout;
-        try {
-            connectionTimeout = Integer.parseInt(getConnectionTimeout());
-        } catch (NumberFormatException ex) {
-            log.warn("Connection timeout is not a number; using the default connection timeout of " + DEFAULT_CONNECTION_TIMEOUT + "ms");
-            connectionTimeout = DEFAULT_CONNECTION_TIMEOUT;
-        }
-        
-        socket.awaitOpen(connectionTimeout, TimeUnit.MILLISECONDS);
-        
-        return socket;
-    }
-    
     @Override
     public SampleResult sample(Entry entry) {
-        ServiceSocket socket = null;
+    	ServiceSocket socket = null;
         SampleResult sampleResult = new SampleResult();
         sampleResult.setSampleLabel(getName());
         sampleResult.setDataEncoding(getContentEncoding());
@@ -116,26 +78,24 @@ public class WebSocketSampler extends AbstractSampler implements TestStateListen
         String payloadMessage = getRequestPayload();
         sampleResult.setSamplerData(payloadMessage);
         
-        //Could improve precission by moving this closer to the action
+        //Could improve precision by moving this closer to the action
         sampleResult.sampleStart();
 
         try {
-            socket = getConnectionSocket();
-            if (socket == null) {
+        	socket = getServiceSocket();
+            boolean connected = connectToServer(socket);
+            
+            if (!connected) {
                 //Couldn't open a connection, set the status and exit
+                sampleResult.sampleEnd();
                 sampleResult.setResponseCode("500");
                 sampleResult.setSuccessful(false);
-                sampleResult.sampleEnd();
-                sampleResult.setResponseMessage(errorList.toString());
                 errorList.append(" - Connection couldn't be opened").append("\n");
+                String logMessage = socket.getLogMessage();
+                sampleResult.setResponseMessage(logMessage + errorList);
                 return sampleResult;
             }
             
-            //Send message only if it is not empty
-            if (!payloadMessage.isEmpty()) {
-                socket.sendMessage(payloadMessage);
-            }
-
             int responseTimeout;
             try {
                 responseTimeout = Integer.parseInt(getResponseTimeout());
@@ -144,11 +104,18 @@ public class WebSocketSampler extends AbstractSampler implements TestStateListen
                 responseTimeout = DEFAULT_RESPONSE_TIMEOUT;
             }
             
+            //Send message only if it is not empty
+            if (!payloadMessage.isEmpty()) {
+                socket.sendMessage(payloadMessage);
+            }
+            
             //Wait for any of the following:
             // - Response matching response pattern is received
             // - Response matching connection closing pattern is received
             // - Timeout is reached
             socket.awaitClose(responseTimeout, TimeUnit.MILLISECONDS);
+            
+            sampleResult.sampleEnd();
             
             //If no response is received set code 204; actually not used...needs to do something else
             if (socket.getResponseMessage() == null || socket.getResponseMessage().isEmpty()) {
@@ -160,12 +127,9 @@ public class WebSocketSampler extends AbstractSampler implements TestStateListen
                 isOK = false;
                 sampleResult.setResponseCode(socket.getError().toString());
             } else {
-                sampleResult.setResponseCodeOK();
-                isOK = true;
+            	isOK = true;
+                sampleResult.setResponseCodeOK();   
             }
-            
-            //set sampler response
-            sampleResult.setResponseData(socket.getResponseMessage(), getContentEncoding());
             
         } catch (URISyntaxException e) {
             errorList.append(" - Invalid URI syntax: ").append(e.getMessage()).append("\n").append(StringUtils.join(e.getStackTrace(), "\n")).append("\n");
@@ -179,13 +143,68 @@ public class WebSocketSampler extends AbstractSampler implements TestStateListen
             errorList.append(" - Unexpected error: ").append(e.getMessage()).append("\n").append(StringUtils.join(e.getStackTrace(), "\n")).append("\n");
         }
         
-        sampleResult.sampleEnd();
+        //Set sampler response
+        sampleResult.setResponseData(socket.getResponseMessage(), getContentEncoding());
         sampleResult.setSuccessful(isOK);
-        
-        String logMessage = (socket != null) ? socket.getLogMessage() : "";
+
+        String logMessage = socket.getLogMessage();
         sampleResult.setResponseMessage(logMessage + errorList);
+        
         return sampleResult;
     }
+    
+    private ServiceSocket getServiceSocket() {
+    	ServiceSocket socket;
+        String connectionId = getConnectionIdWithThreadName();
+        
+        //Create WebSocket client
+        SslContextFactory sslContexFactory = new SslContextFactory();
+        sslContexFactory.setTrustAll(isIgnoreSslErrors());
+        WebSocketClient webSocketClient = new WebSocketClient(sslContexFactory, executor);  
+        
+        if (isStreamingConnection()) {
+             if (connectionList.containsKey(connectionId)) {
+                 socket = connectionList.get(connectionId);
+                 socket.initialize(this);
+                 return socket;
+             } else {
+                socket = new ServiceSocket(this, webSocketClient);
+                connectionList.put(connectionId, socket);
+             }
+        } else {
+            socket = new ServiceSocket(this, webSocketClient);
+        }
+
+        return socket;
+    }
+    
+    private boolean connectToServer(ServiceSocket socket) 
+    		throws Exception {
+    	URI uri = getUri();
+    	boolean connected = socket.isConnected() ? true : false;
+    	WebSocketClient webSocketClient = socket.getWebSocketClient();
+        
+        //Get connection timeout or use the default value
+        int connectionTimeout;
+        try {
+            connectionTimeout = Integer.parseInt(getConnectionTimeout());
+        } catch (NumberFormatException ex) {
+            log.warn("Connection timeout is not a number; using the default connection timeout of " + DEFAULT_CONNECTION_TIMEOUT + "ms");
+            connectionTimeout = DEFAULT_CONNECTION_TIMEOUT;
+        }
+        
+        if (!connected) {
+	        //Start WebSocket client thread and upgrade HTTP connection
+	    	webSocketClient.start();
+	        ClientUpgradeRequest request = new ClientUpgradeRequest();
+	        webSocketClient.connect(socket, uri, request);
+	        
+	        connected = socket.awaitOpen(connectionTimeout, TimeUnit.MILLISECONDS);
+        }
+        
+    	return connected;
+    }
+    
 
     @Override
     public void setName(String name) {
@@ -418,7 +437,13 @@ public class WebSocketSampler extends AbstractSampler implements TestStateListen
             return getPropertyAsString("messageBacklog", "3");
     }
 
+    public Map<String, ServiceSocket> getConnectionList() {
+    	return connectionList;
+    }
     
+    public String getConnectionIdWithThreadName() {
+    	return getThreadName() + getConnectionId();
+    }
     
     public String getQueryString(String contentEncoding) {
         // Check if the sampler has a specified content encoding
@@ -494,7 +519,4 @@ public class WebSocketSampler extends AbstractSampler implements TestStateListen
             socket.close();
         }
     }
-
-
-
 }
