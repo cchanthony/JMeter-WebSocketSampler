@@ -55,6 +55,7 @@ public class WebSocketSampler extends AbstractSampler implements TestStateListen
     
     private static Map<String, ServiceSocket> connectionList;
     private static ExecutorService executor = Executors.newCachedThreadPool();
+    private ServiceSocket globalSocket = null;
 
     public WebSocketSampler() {
         super();
@@ -156,23 +157,26 @@ public class WebSocketSampler extends AbstractSampler implements TestStateListen
     private ServiceSocket getServiceSocket() {
     	ServiceSocket socket;
         String connectionId = getConnectionIdWithThreadName();
-        
-        //Create WebSocket client
-        SslContextFactory sslContexFactory = new SslContextFactory();
-        sslContexFactory.setTrustAll(isIgnoreSslErrors());
-        WebSocketClient webSocketClient = new WebSocketClient(sslContexFactory, executor);  
-        
+
         if (isStreamingConnection()) {
              if (connectionList.containsKey(connectionId)) {
                  socket = connectionList.get(connectionId);
                  socket.initialize(this);
                  return socket;
              } else {
-                socket = new ServiceSocket(this, webSocketClient);
-                connectionList.put(connectionId, socket);
+                 WebSocketClient webSocketClient = createWebSocketClient();      
+                 socket = new ServiceSocket(this, webSocketClient);
+                 connectionList.put(connectionId, socket);
              }
         } else {
-            socket = new ServiceSocket(this, webSocketClient);
+        	if (globalSocket == null) {
+                WebSocketClient webSocketClient = createWebSocketClient();
+                globalSocket = new ServiceSocket(this, webSocketClient);
+        	} else {
+        		globalSocket.initialize(this);
+        	}
+        	
+            return globalSocket;
         }
 
         return socket;
@@ -186,6 +190,7 @@ public class WebSocketSampler extends AbstractSampler implements TestStateListen
         
         //Get connection timeout or use the default value
         int connectionTimeout;
+        
         try {
             connectionTimeout = Integer.parseInt(getConnectionTimeout());
         } catch (NumberFormatException ex) {
@@ -201,7 +206,6 @@ public class WebSocketSampler extends AbstractSampler implements TestStateListen
 	        
 	        connected = socket.awaitOpen(connectionTimeout, TimeUnit.MILLISECONDS);
         }
-        
     	return connected;
     }
     
@@ -495,6 +499,21 @@ public class WebSocketSampler extends AbstractSampler implements TestStateListen
     public Arguments getQueryStringParameters() {
         Arguments args = (Arguments) getProperty("queryStringParameters").getObjectValue();
         return args;
+    }
+    
+    public void removeWebSocketFromConnectionList() {
+    	//Remove WebSocket from connectionList
+        String connectionId = getConnectionIdWithThreadName();
+        connectionList.remove(connectionId);
+    }
+    
+    public WebSocketClient createWebSocketClient () {
+    	//Create WebSocket client
+        SslContextFactory sslContexFactory = new SslContextFactory();
+        sslContexFactory.setTrustAll(isIgnoreSslErrors());
+        WebSocketClient webSocketClient = new WebSocketClient(sslContexFactory, executor);
+        
+        return webSocketClient;
     }
 
 

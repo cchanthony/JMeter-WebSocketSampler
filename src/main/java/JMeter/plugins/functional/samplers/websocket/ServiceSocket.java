@@ -8,12 +8,17 @@ import java.io.IOException;
 import java.util.Deque;
 import java.util.Iterator;
 import java.util.LinkedList;
+import java.util.Queue;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+
 import org.apache.log.Logger;
+
 import java.util.regex.Pattern;
+
 import org.apache.jmeter.engine.util.CompoundVariable;
 import org.apache.jorphan.logging.LoggingManager;
 import org.eclipse.jetty.websocket.api.Session;
@@ -30,15 +35,19 @@ import org.eclipse.jetty.websocket.client.WebSocketClient;
  */
 @WebSocket(maxTextMessageSize = 256 * 1024 * 1024)
 public class ServiceSocket {
-
-    protected final WebSocketSampler sampler;
+	public static int CONNECTION_TIMEOUT = 5000; //5 sec
+	
+    protected WebSocketSampler sampler;
     protected WebSocketClient client;
     private static final Logger log = LoggingManager.getLoggerForClass();
-    protected Deque<String> responeBacklog = new LinkedList<String>();
+    protected Queue<String> responeBacklog = new ConcurrentLinkedQueue<String>();
     protected Integer error = 0;
     protected StringBuffer logMessage = new StringBuffer();
     protected CountDownLatch openLatch = new CountDownLatch(1);
     protected CountDownLatch closeLatch = new CountDownLatch(1);
+    protected CountDownLatch connectingLatch = new CountDownLatch(1);
+    protected CountDownLatch sessionLatch = new CountDownLatch(1);
+    protected CountDownLatch messageLatch = new CountDownLatch(1);
     protected Session session = null;
     protected String responsePattern;
     protected String disconnectPattern;
@@ -47,31 +56,49 @@ public class ServiceSocket {
     protected Pattern disconnectExpression;
     protected boolean connected = false;
     protected boolean disconnect = false;
+    protected boolean matched = false;
 
     public ServiceSocket(WebSocketSampler sampler, WebSocketClient client) {
         this.sampler = sampler;
         this.client = client;
         
         logMessage.append("\n\n[Execution Flow]\n");
+        logMessage.append(" - Connection for " + sampler.getConnectionIdWithThreadName() + "\n");
         logMessage.append(" - Opening new connection\n");
         
-        //Evaluate response matching patterns in case thay contain JMeter variables (i.e. ${var})
+        //Evaluate response matching patterns in case they contain JMeter variables (i.e. ${var})
         responsePattern = new CompoundVariable(sampler.getResponsePattern()).execute();
         disconnectPattern = new CompoundVariable(sampler.getCloseConncectionPattern()).execute();
         initializePatterns();
     }
     
     public void initialize(WebSocketSampler sampler) {
+    	this.sampler = sampler;
         logMessage = new StringBuffer();
         logMessage.append("\n\n[Execution Flow]\n");
-        logMessage.append(" - Reusing exising connection\n");
+        logMessage.append(" - Connection for " + sampler.getConnectionIdWithThreadName() + "\n");
+        
+        if (!connected) {
+        	logMessage.append(" - Opening new connection\n");
+        	responeBacklog.clear();
+        	openLatch = new CountDownLatch(1);
+        	connectingLatch = new CountDownLatch(1);
+            sessionLatch = new CountDownLatch(1);
+        	messageCounter = 1;
+        	session = null;
+        } else {
+        	logMessage.append(" - Reusing exising connection\n");
+        }
+        
         error = 0;
-
-        this.closeLatch = new CountDownLatch(1);
+        closeLatch = new CountDownLatch(1);
+        messageLatch = new CountDownLatch(1);
+        disconnect = false;
+        matched = false;
         
         this.sampler.setStreamingConnection(sampler.isStreamingConnection());
-        this.responsePattern = new CompoundVariable(sampler.getResponsePattern()).execute();
-        this.disconnectPattern = new CompoundVariable(sampler.getCloseConncectionPattern()).execute();
+        responsePattern = new CompoundVariable(sampler.getResponsePattern()).execute();
+        disconnectPattern = new CompoundVariable(sampler.getCloseConncectionPattern()).execute();
         initializePatterns();
     }
     
@@ -96,34 +123,47 @@ public class ServiceSocket {
     }
 
     @OnWebSocketMessage
-    public void onMessage(String msg) {
+    public void onMessage(String msg) throws InterruptedException {
         synchronized (sampler) {
-            log.debug("Received message: " + msg);
-            String length = " (" + msg.length() + " bytes)";
-            logMessage.append(" - Received message #").append(messageCounter).append(length);
-            addResponseMessage("[Message " + (messageCounter++) + "]\n" + msg + "\n\n");
-
-            if (responseExpression == null && disconnectExpression == null || 
-            		responseExpression != null && responseExpression.matcher(msg).find()) {
-                logMessage.append("; matched response pattern").append("\n");
-                closeLatch.countDown();
-            } else if (disconnectExpression != null && disconnectExpression.matcher(msg).find()) {
-                logMessage.append("; matched connection close pattern").append("\n");
-                disconnect = true;
-                closeLatch.countDown();
-            } else {
-                logMessage.append("; didn't match any pattern").append("\n");
-            }
+        	this.messageLatch.await();
+	    	if (!matched) {
+	            log.debug("Received message: " + msg);
+	            String length = " (" + msg.length() + " bytes)";
+	            logMessage.append(" - Received message #").append(messageCounter).append(length);
+	            addResponseMessage("[Message " + (messageCounter++) + "]\n" + msg + "\n\n");
+	
+	            if (responseExpression == null && disconnectExpression == null || 
+	            		responseExpression != null && responseExpression.matcher(msg).find()) {
+	            	matched = true;
+	                logMessage.append("; matched response pattern").append("\n");
+	                closeLatch.countDown();
+	            } else if (disconnectExpression != null && disconnectExpression.matcher(msg).find()) {
+	                logMessage.append("; matched connection close pattern").append("\n");
+	                matched = true;
+	                disconnect = true;
+	                closeLatch.countDown();
+	            } else {
+	                logMessage.append("; didn't match any pattern").append("\n");
+	            }
+	    	}
         }
     }
 
     @OnWebSocketConnect
-    public void onOpen(Session session) {
-        logMessage.append(" - WebSocket conection has been opened").append("\n");
-        log.debug("Connect " + session.isOpen());
-        this.session = session;
-        connected = true;
-        openLatch.countDown();
+    public void onOpen(Session session) throws InterruptedException {
+    	connected = true;
+    	openLatch.countDown();
+    	this.connectingLatch.await(CONNECTION_TIMEOUT, TimeUnit.MILLISECONDS);
+    	
+    	if (!disconnect) {
+    		this.session = session;
+	    	logMessage.append(" - WebSocket connection has been opened").append("\n");
+			log.debug("Connect " + session.isOpen());
+    	} else {
+    		session.close(StatusCode.NORMAL, "JMeter closed session.");
+    		connected = false;
+    	}
+    	sessionLatch.countDown();
     }
 
     @OnWebSocketClose
@@ -138,26 +178,39 @@ public class ServiceSocket {
         }
         
         //Notify connection opening and closing latches of the closed connection
-        connected = false;
         openLatch.countDown();
         closeLatch.countDown();
+        connectingLatch.countDown();
+        sessionLatch.countDown();
     }
 
     public boolean awaitOpen(int duration, TimeUnit unit) throws InterruptedException {
         logMessage.append(" - Waiting for the server connection for ").append(duration).append(" ").append(unit.toString()).append("\n");
         boolean res = this.openLatch.await(duration, unit);
-
-        if (connected) {
-            logMessage.append(" - Connection established").append("\n");
-        } else {
-            logMessage.append(" - Cannot connect to the remote server").append("\n");
-        }
-
+        
+	    if (connected) {
+	        logMessage.append(" - Connection established").append("\n");
+	    } else {
+	    	logMessage.append(" - Cannot connect to the remote server").append("\n");
+	        disconnect = true;
+	        try {
+	            client.stop();
+	            logMessage.append(" - WebSocket client closed by the client").append("\n");
+	        } catch (Exception e) {
+	            logMessage.append(" - WebSocket client wasn't started (...that's odd)").append("\n");
+	        }
+	    }
+	    
+	    sessionLatch = new CountDownLatch(1);
+	    connectingLatch.countDown();
+	    this.sessionLatch.await(CONNECTION_TIMEOUT, TimeUnit.MILLISECONDS);
+	    
         return res;
     }
     
     public boolean awaitClose(int duration, TimeUnit unit) throws InterruptedException {
         logMessage.append(" - Waiting for messages for ").append(duration).append(" ").append(unit.toString()).append("\n");
+        messageLatch.countDown();
         boolean res = this.closeLatch.await(duration, unit);
 
         if (!sampler.isStreamingConnection() || disconnect) {
@@ -174,11 +227,7 @@ public class ServiceSocket {
     }
 
     public void close(int statusCode, String statusText) {
-    	//Remove WebSocket from connectionList
-        Map<String, ServiceSocket> connectionList = sampler.getConnectionList();
-        String connectionId = sampler.getConnectionIdWithThreadName();
-        connectionList.remove(connectionId);
-        
+    	
         //Closing WebSocket session
         if (session != null) {
             session.close(statusCode, statusText);
@@ -187,7 +236,6 @@ public class ServiceSocket {
             logMessage.append(" - WebSocket session wasn't started (...that's odd)").append("\n");
         }
         
-        
         //Stopping WebSocket client; thanks m0ro
         try {
             client.stop();
@@ -195,6 +243,8 @@ public class ServiceSocket {
         } catch (Exception e) {
             logMessage.append(" - WebSocket client wasn't started (...that's odd)").append("\n");
         }
+        
+        connected = false;
     }
     
     /**
