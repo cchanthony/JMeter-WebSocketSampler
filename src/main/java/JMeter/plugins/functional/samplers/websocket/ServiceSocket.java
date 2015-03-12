@@ -193,12 +193,6 @@ public class ServiceSocket {
 	    } else {
 	    	logMessage.append(" - Cannot connect to the remote server").append("\n");
 	        disconnect = true;
-	        try {
-	            client.stop();
-	            logMessage.append(" - WebSocket client closed by the client").append("\n");
-	        } catch (Exception e) {
-	            logMessage.append(" - WebSocket client wasn't started (...that's odd)").append("\n");
-	        }
 	    }
 	    
 	    sessionLatch = new CountDownLatch(1);
@@ -235,15 +229,7 @@ public class ServiceSocket {
         } else {
             logMessage.append(" - WebSocket session wasn't started (...that's odd)").append("\n");
         }
-        
-        //Stopping WebSocket client; thanks m0ro
-        try {
-            client.stop();
-            logMessage.append(" - WebSocket client closed by the client").append("\n");
-        } catch (Exception e) {
-            logMessage.append(" - WebSocket client wasn't started (...that's odd)").append("\n");
-        }
-        
+
         connected = false;
     }
     
@@ -318,5 +304,15 @@ public class ServiceSocket {
      */
     public boolean isConnected() {
         return connected;
+    }
+    
+    public void stopClient() {
+    	//Stopping WebSocket client; thanks m0ro
+        try {
+            client.stop();
+            logMessage.append(" - WebSocket client closed by the client").append("\n");
+        } catch (Exception e) {
+            logMessage.append(" - WebSocket client wasn't started (...that's odd)").append("\n");
+        }
     }
 }

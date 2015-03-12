@@ -154,7 +154,7 @@ public class WebSocketSampler extends AbstractSampler implements TestStateListen
         return sampleResult;
     }
     
-    private ServiceSocket getServiceSocket() {
+    private ServiceSocket getServiceSocket() throws Exception {
     	ServiceSocket socket;
         String connectionId = getConnectionIdWithThreadName();
 
@@ -167,11 +167,15 @@ public class WebSocketSampler extends AbstractSampler implements TestStateListen
                  WebSocketClient webSocketClient = createWebSocketClient();      
                  socket = new ServiceSocket(this, webSocketClient);
                  connectionList.put(connectionId, socket);
+                 //Start WebSocket client thread and upgrade HTTP connection
+     	    	 webSocketClient.start();
              }
         } else {
         	if (globalSocket == null) {
                 WebSocketClient webSocketClient = createWebSocketClient();
                 globalSocket = new ServiceSocket(this, webSocketClient);
+                //Start WebSocket client thread and upgrade HTTP connection
+    	    	webSocketClient.start();
         	} else {
         		globalSocket.initialize(this);
         	}
@@ -199,8 +203,6 @@ public class WebSocketSampler extends AbstractSampler implements TestStateListen
         }
         
         if (!connected) {
-	        //Start WebSocket client thread and upgrade HTTP connection
-	    	webSocketClient.start();
 	        ClientUpgradeRequest request = new ClientUpgradeRequest();
 	        webSocketClient.connect(socket, uri, request);
 	        
@@ -536,6 +538,7 @@ public class WebSocketSampler extends AbstractSampler implements TestStateListen
     public void testEnded(String host) {
         for (ServiceSocket socket : connectionList.values()) {
             socket.close();
+            socket.stopClient();
         }
     }
 }
